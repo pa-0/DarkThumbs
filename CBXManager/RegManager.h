@@ -14,16 +14,20 @@
 
 #define CBX_GUID_KEY _T("{9E6ECB90-5A61-42BD-B851-D3297D9C7F39}") //38+1 TCHAR
 #define CBX_GUID_KEY_SLEN 39
-#define CBX_APP_KEY _T("Software\\T800 Productions\\{9E6ECB90-5A61-42BD-B851-D3297D9C7F39}")
+#define CBX_APP_KEY _T("Software\\DarkThumbs\\{9E6ECB90-5A61-42BD-B851-D3297D9C7F39}")
 
 // per-user settings (HKCU)
 // thumbnail handler keys
-#define CBX_ZIPTH_KEY _T("SOFTWARE\\Classes\\.ZIP\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
-#define CBX_CBZTH_KEY _T("SOFTWARE\\Classes\\.CBZ\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
-#define CBX_RARTH_KEY _T("SOFTWARE\\Classes\\.RAR\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
-#define CBX_CBRTH_KEY _T("SOFTWARE\\Classes\\.CBR\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
-#define CBX_EPUBTH_KEY _T("SOFTWARE\\Classes\\.EPUB\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
-#define CBX_MOBITH_KEY _T("SOFTWARE\\Classes\\.MOBI\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_ZIPTH_KEY   _T("SOFTWARE\\Classes\\.ZIP\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_CBZTH_KEY   _T("SOFTWARE\\Classes\\.CBZ\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_RARTH_KEY   _T("SOFTWARE\\Classes\\.RAR\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_CBRTH_KEY   _T("SOFTWARE\\Classes\\.CBR\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_EPUBTH_KEY  _T("SOFTWARE\\Classes\\.EPUB\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_MOBITH1_KEY _T("SOFTWARE\\Classes\\.MOBI\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_MOBITH2_KEY _T("SOFTWARE\\Classes\\.AZW\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_MOBITH3_KEY _T("SOFTWARE\\Classes\\.AZW3\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+#define CBX_FBTH_KEY    _T("SOFTWARE\\Classes\\.FB2\\shellex\\{BB2E617C-0920-11d1-9A0B-00C04FC2D6C1}")
+
 // infotip handler keys
 #define CBX_ZIPIH_KEY _T("SOFTWARE\\Classes\\.ZIP\\shellex\\{00021500-0000-0000-C000-000000000046}")
 #define CBX_CBZIH_KEY _T("SOFTWARE\\Classes\\.CBZ\\shellex\\{00021500-0000-0000-C000-000000000046}")
@@ -39,8 +43,15 @@
 #define CBX_CBR 4
 #define CBX_EPUB 5
 #define CBX_MOBI 6
+#define CBX_AZW 7
+#define CBX_AZW3 8
+#define CBX_FB2  9
 //#define CBX_SORT 5
 
+#define SORT_KEY L"NoSort"
+#define SKIP_KEY L"SkipScanlation"
+#define COVER_KEY L"PreferCover"
+#define ICON_KEY L"ShowIcon"
 
 class CRegManager
 {
@@ -49,48 +60,44 @@ public:
 	//virtual ~CRegManager(void){}
 public:
 
-	///////////////
-	// sort option
-	BOOL IsSortOpt()
-	{
-		DWORD d;
-		CRegKey rk;
-		if (ERROR_SUCCESS==rk.Open(HKEY_CURRENT_USER, CBX_APP_KEY, KEY_READ))
-		{
-			if (ERROR_SUCCESS==rk.QueryDWORDValue(_T("NoSort"), d))
-				return (d==FALSE);
-		}
-	return TRUE;
-	}
-
-	void SetSortOpt(BOOL bSort)
-	{
-		CRegKey rk;
-		if (ERROR_SUCCESS==rk.Create(HKEY_CURRENT_USER, CBX_APP_KEY, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE))
-			rk.SetDWORDValue(_T("NoSort"), (DWORD)(bSort ? FALSE : TRUE));
-	}
-
-	// sort option
-	BOOL IsShowIconOpt()
+	BOOL IsOption(const wchar_t* optionKey)
 	{
 		DWORD d;
 		CRegKey rk;
 		if (ERROR_SUCCESS == rk.Open(HKEY_CURRENT_USER, CBX_APP_KEY, KEY_READ))
 		{
-			if (ERROR_SUCCESS == rk.QueryDWORDValue(_T("ShowIcon"), d))
-				return (d == TRUE);
+			if (ERROR_SUCCESS == rk.QueryDWORDValue(optionKey, d))
+				return (d == 1);
 		}
-		return TRUE;
+		return FALSE;
 	}
 
-	//////////////
-	// set show archive Icon
-	void SetShowIconOpt(BOOL bShowIcon)
+	void SetOption(const wchar_t* optionKey, BOOL val)
 	{
 		CRegKey rk;
 		if (ERROR_SUCCESS == rk.Create(HKEY_CURRENT_USER, CBX_APP_KEY, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE))
-			rk.SetDWORDValue(_T("ShowIcon"), (DWORD)(bShowIcon ? TRUE : FALSE));
+			rk.SetDWORDValue(optionKey, (DWORD)(val ? TRUE : FALSE));
 	}
+
+	///////////////
+	// sort option. The registry key is "backward", as it records the "NoSort" state.
+	BOOL IsSortOpt() { return !IsOption(SORT_KEY); }
+	void SetSortOpt(BOOL bSort) { SetOption(SORT_KEY, !bSort); }
+
+	//////////////
+	// show archive Icon
+	BOOL IsShowIconOpt() { return IsOption(ICON_KEY); }
+	void SetShowIconOpt(BOOL bShowIcon) { SetOption(ICON_KEY, bShowIcon); }
+
+	///////////////
+	// V1.7 skip option
+	BOOL IsSkipOpt() { return IsOption(SKIP_KEY); }
+	void SetSkipOpt(BOOL val) { SetOption(SKIP_KEY, val); }
+
+	///////////////
+	// V1.7 cover option
+	BOOL IsCoverOpt() { return IsOption(COVER_KEY); }
+	void SetCoverOpt(BOOL val) { SetOption(COVER_KEY, val); }
 
 	///////////////////////////////
 	// check for thumbnail handlers
@@ -168,7 +175,10 @@ public:
 		case CBX_EPUB: return CBX_EPUBTH_KEY;
 		case CBX_RAR: return CBX_RARTH_KEY;
 		case CBX_CBR: return CBX_CBRTH_KEY;
-		case CBX_MOBI: return CBX_MOBITH_KEY;
+		case CBX_MOBI: return CBX_MOBITH1_KEY;
+		case CBX_AZW: return CBX_MOBITH2_KEY;
+		case CBX_AZW3: return CBX_MOBITH3_KEY;
+		case CBX_FB2: return CBX_FBTH_KEY;
 		default:break;
 		}
 	return NULL;

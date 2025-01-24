@@ -1,3 +1,10 @@
+/*
+* DarkThumbs - Windows Explorer thumbnails for ebooks, image archives
+* Copyright © 2020-2022 by Kevin Routley. All rights reserved.
+*
+* Primary processing code.
+*/
+
 ///////////////////////////////////////////////
 // v4.6
 //////////////////////////////////////////////
@@ -31,9 +38,15 @@
 #else
 #pragma comment(lib,"unrar.lib")
 #endif
-#include "unzip.h"
+#include "cunzip.h"
 #include <string>
+#ifdef _WIN64
 #include "mobi.h"
+#endif
+
+#ifdef _DEBUG
+#include "debugapi.h"
+#endif
 
 #define CBXMEM_MAXBUFFER_SIZE 33554432 //32mb
 #define CBXTYPE int
@@ -43,62 +56,28 @@
 #define CBXTYPE_RAR  3
 #define CBXTYPE_CBR  4
 #define CBXTYPE_EPUB 5
+#ifdef _WIN64
 #define CBXTYPE_MOBI 6
+#endif
+#define CBXTYPE_FB   7
 
-#define CBX_APP_KEY _T("Software\\T800 Productions\\{9E6ECB90-5A61-42BD-B851-D3297D9C7F39}")
+#define CBX_APP_KEY _T("Software\\DarkThumbs\\{9E6ECB90-5A61-42BD-B851-D3297D9C7F39}")
+
+CString GetEpubTitle(CString);
+HRESULT ExtractEpub(CString m_cbxFile, HBITMAP* phBmpThumbnail, SIZE m_thumbSize, BOOL m_showIcon);
+
+inline BOOL StrEqual(LPCTSTR psz1, LPCTSTR psz2);
+BOOL IsImage(LPCTSTR szFile);
+HBITMAP ThumbnailFromIStream(IStream* pIs, const LPSIZE pThumbSize, bool showIcon);
+HRESULT WICCreate32BitsPerPixelHBITMAP(IStream* pstm, HBITMAP* phbmp);
+void addIcon(HBITMAP* phBmpThumbnail);
+
+HRESULT ExtractFBCover(CString filepath, HBITMAP* phBmpThumbnail);
+
+extern void __cdecl logit(LPCWSTR format, ...);
 
 namespace __cbx {
 
-class CUnzip
-{
-public:
-		CUnzip() { hz=NULL; }
-		virtual ~CUnzip(){::CloseZip(hz);}
-
-public:
-		bool Open(LPCTSTR zfile)
-		{
-			if (zfile==NULL) return false;
-			HZIP temp_hz=::OpenZip(zfile, NULL);//try new
-			if (temp_hz==NULL) return false;
-			Close();//close old
-			hz=temp_hz;
-			if (ZR_OK!=::GetZipItem(hz,-1, &maindirEntry)) return false;
-		return true;
-		}
-
-		bool GetItem(int zi)
-		{
-			zr=::GetZipItem(hz, zi, &ZipEntry);
-		return (ZR_OK==zr);
-		}
-
-		bool UnzipItemToMembuffer(int index, void *z,unsigned int len)
-		{
-			zr=::UnzipItem(hz, index, z, len);
-		return (ZR_OK==zr);
-		}
-
-		void Close()
-		{
-			CloseZip(hz);
-			hz=NULL;//critical!
-		}
-
-		inline BOOL ItemIsDirectory() {return (BOOL)(CUnzip::GetItemAttributes() & 0x0010);}
-		int GetItemCount() const {return maindirEntry.index;}
-		long GetItemPackedSize() const {return ZipEntry.comp_size;}
-		long GetItemUnpackedSize() const {return ZipEntry.unc_size;}
-		DWORD GetItemAttributes() const {return ZipEntry.attr;}
-		LPCTSTR GetItemName() {return ZipEntry.name;}
-		
-		HZIP getHZIP() { return hz; }	
-
-private:
-		ZIPENTRY ZipEntry, maindirEntry;
-		HZIP hz;
-		ZRESULT zr;
-};
 
 // unrar wrapper
 typedef const RARHeaderDataEx* LPCRARHeaderDataEx;
@@ -109,6 +88,7 @@ class CUnRar
 public:
 	CUnRar() { if (RAR_DLL_VERSION>RARGetDllVersion()) throw RAR_DLL_VERSION;	_init(); }
 	virtual ~CUnRar(){Close();_init();}
+	void Shutdown() { Close(); _init(); }
 
 public:
 	BOOL Open(LPCTSTR rarfile, BOOL bListingOnly=TRUE, char* cmtBuf=NULL, UINT cmtBufSize=0, char* password=NULL)
@@ -202,16 +182,29 @@ public:
 
 	virtual int ProcessItemData(LPBYTE pBuf, ULONG dwBufSize)
 	{
+		logit(_T("PID: %ld"), dwBufSize);
 		if (m_pIs)
 		{
 			ULONG br=0;
-			if (S_OK==m_pIs->Write(pBuf, dwBufSize, &br))
-				if (br==dwBufSize) return 1;
+			if (S_OK == m_pIs->Write(pBuf, dwBufSize, &br))
+			{
+				if (br == dwBufSize) return 1;
+				else logit(_T("--write %ld"), br);
+			}
 		}
+		if (m_pBuf)
+		{
+			// The "problem cbr" files have 3 callbacks, data has to be appended
+			memcpy(m_pBuf, pBuf, dwBufSize);
+			m_pBuf += dwBufSize;
+			return 1;
+		}
+		logit(_T("PID: fail"));
 	return -1;
 	}
 
 	void SetIStream(IStream* pIs){_ASSERTE(pIs);m_pIs=pIs;}
+	void SetBuffer(LPBYTE pbuf) { _ASSERTE(pbuf); m_pBuf = pbuf; }
 
 private:
 	HANDLE m_harc;
@@ -219,6 +212,7 @@ private:
 	RAROpenArchiveDataEx m_arcinfo;
 	int m_ret;
 	IStream* m_pIs;
+	LPBYTE m_pBuf;
 	void _init()
 	{
 		m_harc=NULL;
@@ -239,15 +233,18 @@ public:
 
 class CCBXArchive
 {
-
 public:
 	CCBXArchive()
 	{
 		m_bSort=TRUE;//default
+		m_showIcon = FALSE;
 		//GetRegSettings();
 		m_thumbSize.cx=m_thumbSize.cy=0;
 		m_cbxType=CBXTYPE_NONE;
 		m_pIs=NULL;
+
+		m_bSkip = FALSE;  // V1.7 : new setting, don't change existing behavior
+		m_bCover = FALSE; // V1.7
 	}
 
 	virtual ~CCBXArchive()
@@ -255,10 +252,11 @@ public:
 		if (m_pIs) {m_pIs->Release(); m_pIs=NULL;}
 	}
 
-	//
+#ifdef _WIN64
+    //
 	// Extrapolated from mobitool.c in the libmobi repo. See https://github.com/bfabiszewski/libmobi
 	//
-	int fetchMobiCover(const MOBIData* m, HBITMAP* phBmpThumbnail, SIZE thumbSize) 
+	int fetchMobiCover(const MOBIData* m, HBITMAP* phBmpThumbnail, SIZE thumbSize, BOOL showIcon) 
 	{
 		MOBIPdbRecord* record = NULL;
 		MOBIExthHeader* exth = mobi_get_exthrecord_by_tag(m, EXTH_COVEROFFSET);
@@ -275,6 +273,7 @@ public:
 		}
 
 		HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)record->size);
+		//HRESULT hr = E_FAIL;
 		if (hG)
 		{
 			LPVOID pBuf = ::GlobalLock(hG);
@@ -286,7 +285,15 @@ public:
 				IStream* pIs = NULL;
 				if (S_OK == CreateStreamOnHGlobal(hG, TRUE, (LPSTREAM*)&pIs))//autofree hG
 				{
-					*phBmpThumbnail = ThumbnailFromIStream(pIs, &thumbSize, false);
+					// Issue #84: never show archive icon for MOBI
+					//*phBmpThumbnail = ThumbnailFromIStream(pIs, &thumbSize, FALSE); // showIcon);
+					//hr = WICCreate32BitsPerPixelHBITMAP(pIs, phBmpThumbnail);
+
+					// Issue *86 use WIC for mobi
+					IStream* pImageStream = SHCreateMemStream((const BYTE*)pBuf, record->size);
+					HRESULT hr = WICCreate32BitsPerPixelHBITMAP(pImageStream, phBmpThumbnail);
+					pImageStream->Release();
+
 					pIs->Release();
 					pIs = NULL;
 				}
@@ -299,7 +306,7 @@ public:
 	//
 	// Extrapolated from mobitool.c in the libmobi repo. See https://github.com/bfabiszewski/libmobi
 	//
-	HRESULT ExtractMobiCover(CString filepath, HBITMAP* phBmpThumbnail)
+	HRESULT ExtractMobiCover(CString filepath, HBITMAP* phBmpThumbnail, BOOL showIcon)
 	{
 		MOBI_RET mobi_ret;
 		int ret = S_OK;
@@ -331,94 +338,266 @@ public:
 			return E_FAIL;
 		}
 
-		ret = fetchMobiCover(m, phBmpThumbnail, m_thumbSize);
+		ret = fetchMobiCover(m, phBmpThumbnail, m_thumbSize, showIcon);
 		/* Free MOBIData structure */
 		mobi_free(m);
 		return ret;
 	}
+#endif
 
-	static inline BOOL Draw(
-		CImage ci,
-		_In_ HDC hDestDC,
-		_In_ int xDest,
-		_In_ int yDest,
-		_In_ int nDestWidth,
-		_In_ int nDestHeight,
-		_In_ int xSrc,
-		_In_ int ySrc,
-		_In_ int nSrcWidth,
-		_In_ int nSrcHeight,
-		_In_ Gdiplus::InterpolationMode interpolationMode) throw()
+	HRESULT ExtractZip(HBITMAP* phBmpThumbnail, BOOL toSort)
 	{
-		Gdiplus::Bitmap bm((HBITMAP)ci, NULL);
-		if (bm.GetLastStatus() != Gdiplus::Ok)
+		//logit(_T("Z:sort:'%d'"), toSort);
+
+		CUnzip _z;
+		if (!_z.Open(m_cbxFile)) 
+			return E_FAIL;
+		int j = _z.GetItemCount();
+		if (j == 0) 
+			return E_FAIL;
+
+		CString prevname;
+		int foundIndex = -1;
+
+		for (int i = 0; i < j; i++)
 		{
-			return FALSE;
+			// Skip empty items, directories, etc.
+			if (!_z.GetItem(i)) break;
+			if (_z.ItemIsDirectory() || (_z.GetItemUnpackedSize() > CBXMEM_MAXBUFFER_SIZE)) continue;
+			if ((_z.GetItemPackedSize() == 0) || (_z.GetItemUnpackedSize() == 0)) continue;
+
+			CString iName = _z.GetItemName();
+
+			// Skip non-images and other undesirables
+			if (iName.Find(L"__MACOSX") != -1) continue;
+			if (!IsImage(iName)) continue;
+
+			// Skipping scanlation files takes precedence
+			auto allLower = iName.MakeLower();
+			if (m_bSkip)
+			{
+				// TODO could these come from a registry setting?
+				// TODO manga like "Death Note" which might fail all images?
+				if (allLower.Find(L"credit") != -1 ||
+					allLower.Find(L"note") != -1 ||
+					allLower.Find(L"recruit") != -1 ||
+					allLower.Find(L"invite") != -1 ||
+					allLower.Find(L"logo") != -1)
+				{
+					continue;
+				}
+			}
+
+			// Not a skipped image
+			if (!toSort)
+			{
+				foundIndex = i; // Not sorting: take the first non-skipped image file
+				break;
+			}
+			if (m_bCover && allLower.Find(L"cover") != -1)
+			{
+				foundIndex = i; // Seeking cover file: take the first "cover"
+				break;
+			}
+
+			// During sorting, force certain characters to sort later.
+			allLower.Replace(L"[", L"z");
+
+			//logit(_T("Z:'%ls'(%d) vs '%ls(%d)'"), allLower, i, prevname, foundIndex);
+
+			// So we're sorting. Want to take the first file in alphabetic order
+			if (prevname.IsEmpty())
+			{
+				prevname = allLower;// can't compare empty string
+				foundIndex = i;  // initialize when sorting
+			}
+			else if (-1 == StrCmpLogicalW(allLower, prevname))
+			{
+				foundIndex = i;
+				prevname = allLower;
+			}
+
+
+		}//for loop
+
+		if (foundIndex < 0) 
+			return E_FAIL;
+
+		//go to thumb index
+		if (!_z.GetItem(foundIndex)) 
+			return E_FAIL;
+
+		//create thumb			//GHND
+		HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)_z.GetItemUnpackedSize());
+		if (hG)
+		{
+			bool b = false;
+			LPVOID pBuf = ::GlobalLock(hG);
+
+			long itemSize = _z.GetItemUnpackedSize();
+			if (pBuf)
+				b = _z.UnzipItemToMembuffer(foundIndex, pBuf, itemSize);
+
+			if (::GlobalUnlock(hG) == 0 && GetLastError() == NO_ERROR && b)
+			{
+				IStream* pImageStream = SHCreateMemStream((const BYTE*)pBuf, itemSize);
+				HRESULT hr = WICCreate32BitsPerPixelHBITMAP(pImageStream, phBmpThumbnail);
+				pImageStream->Release();
+			}
+			GlobalFree(hG);
 		}
 
-		Gdiplus::Graphics dcDst(hDestDC);
-		dcDst.SetInterpolationMode(interpolationMode);
+		if (m_showIcon)
+			addIcon(phBmpThumbnail);
 
-		Gdiplus::Rect destRec(xDest, yDest, nDestWidth, nDestHeight);
-
-		Gdiplus::Status status = dcDst.DrawImage(&bm, destRec, xSrc, ySrc, nSrcWidth, nSrcHeight, Gdiplus::Unit::UnitPixel);
-
-		return status == Gdiplus::Ok;
+		return ((*phBmpThumbnail) ? S_OK : E_FAIL);
 	}
 
-
-	HBITMAP ThumbnailFromIStream(IStream* pIs, const LPSIZE pThumbSize, bool showIcon)
+	HRESULT ExtractRar(HBITMAP* phBmpThumbnail)
 	{
-		ATLASSERT(pIs);
-		CImage ci;//uses gdi+ internally
-		if (S_OK != ci.Load(pIs)) return NULL;
+		//logit(_T("R:sort:'%d'"), m_bSort);
 
-		//check size
-		int tw = ci.GetWidth();
-		int th = ci.GetHeight();
-		float cx = (float)pThumbSize->cx;
-		float cy = (float)pThumbSize->cy;
-		float rx = cx / (float)tw;
-		float ry = cy / (float)th;
+		CUnRar _r;
 
-		//if bigger size
-		if ((rx < 1) || (ry < 1))
+		if (!_r.Open(m_cbxFile, FALSE))
+			return E_FAIL;
+
+		// Skip volumes or encrypted
+		if (_r.IsArchiveVolume() || _r.IsArchiveEncryptedHeaders()) 
+			return E_FAIL;
+
+		CString prevname; // sorting
+		int foundIndex = -1;
+		int i = -1;
+
+		while (_r.ReadItemInfo())
 		{
-			CDC hdcNew = ::CreateCompatibleDC(NULL);
-			if (hdcNew.IsNull()) return NULL;
+			i++;
+			//skip directory/empty/ file bigger than 32mb
+			if (_r.IsItemDirectory() || (_r.GetItemPackedSize64() == 0) ||
+				(_r.GetItemUnpackedSize64() == 0) || (_r.GetItemUnpackedSize64() > CBXMEM_MAXBUFFER_SIZE))
+			{
+				_r.SkipItem();
+				continue;
+			}
 
-			hdcNew.SetStretchBltMode(HALFTONE);
-			hdcNew.SetBrushOrg(0, 0, NULL);
-			//variables retain values until assignment
-			tw = (int)(min(rx, ry) * tw);//C424 warning workaround
-			th = (int)(min(rx, ry) * th);
+			CString iName = _r.GetItemName();
 
-			CBitmap hbmpNew;
-			hbmpNew.CreateCompatibleBitmap(ci.GetDC(), tw, th);
-			ci.ReleaseDC();//don't forget!
-			if (hbmpNew.IsNull()) return NULL;
+			// Skip non-image
+			if (!IsImage(iName))
+			{
+				_r.SkipItem();
+				continue;
+			}
 
-			HBITMAP hbmpOld = hdcNew.SelectBitmap(hbmpNew);
-			hdcNew.FillSolidRect(0, 0, tw, th, RGB(255, 255, 255));//white background
+			// Skipping scanlation files takes precedence
+			auto allLower = iName.MakeLower();
+			if (m_bSkip)
+			{
+				// TODO refactor to subroutine
+				if (allLower.Find(L"credit") != -1 ||
+					allLower.Find(L"note") != -1 ||
+					allLower.Find(L"recruit") != -1 ||
+					allLower.Find(L"invite") != -1 ||
+					allLower.Find(L"logo") != -1)
+				{
+					_r.SkipItem();
+					continue;
+				}
+			}
 
-			Draw(ci, hdcNew, 0, 0, tw, th, 0, 0, ci.GetWidth(), ci.GetHeight(), Gdiplus::InterpolationMode::InterpolationModeHighQualityBicubic);//too late for error checks
-			if (showIcon)
-				DrawIcon(hdcNew, 0, 0, zipIcon);
+			// For the next two tests, if they pass, the CUnrar instance is
+			// "set" to the item of interest. When sorting, it may be required
+			// to "rewind" the CUnrar instance to the item desired.
+			if (!m_bSort)
+			{
+				goto AtThumb;
+			}
+			if (m_bCover && allLower.Find(L"cover") != -1)
+			{
+				goto AtThumb; // Seeking cover file: take the first "cover"
+			}
 
-			hdcNew.SelectBitmap(hbmpOld);
+			//logit(_T("R:'%ls'(%d) vs '%ls(%d)'"), allLower, i, prevname, foundIndex);
 
-			return hbmpNew.Detach();
+			// We're sorting. Want to take the first file in natural order.
+			if (prevname.IsEmpty())
+			{
+				prevname = allLower;// can't compare empty string
+				foundIndex = i;  // initialize when sorting
+			}
+			else if (-1 == StrCmpLogicalW(allLower, prevname))
+			{
+				foundIndex = i;
+				prevname = allLower;
+			}
+			_r.SkipItem();
+
 		}
 
-		return ci.Detach();
-	}
+		if (foundIndex < 0) 
+		{
+			logit(_T("R Fail 1")); return E_FAIL;
+		}
 
+		// Need to reposition the archive to the item of interest
+		// TODO why can't RAR be reset w/o closing and re-opening?
+		_r.Shutdown();
+		if (!_r.Open(m_cbxFile, FALSE)) 
+		{
+			logit(_T("R Fail 2")); return E_FAIL;
+		}
+		if (!_r.SkipItems(foundIndex))
+		{
+			logit(_T("R Fail 3")); return E_FAIL;
+		}
+		if (!_r.ReadItemInfo())
+		{
+			logit(_T("R Fail 4")); return E_FAIL;
+		}
+
+AtThumb:
+		// _r is currently 'positioned' at the item desired
+
+		//create thumb
+		IStream* pIs = NULL;
+		UINT64 itemSize = _r.GetItemUnpackedSize64();
+		logit(_T("R: itemsize %ld"), itemSize);
+		HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (UINT)itemSize);
+		//HRESULT hr;
+		if (hG)
+		{
+			LPVOID pBuf = ::GlobalLock(hG);
+			LPVOID origbuf = pBuf; // note that _r.ProcessItem() could modify the buffer pointer!
+
+			if (S_OK == CreateStreamOnHGlobal(hG, TRUE, (LPSTREAM*)&pIs))
+			{
+				//_r.SetIStream(pIs);
+				_r.SetIStream(NULL);
+				_r.SetBuffer((LPBYTE)pBuf);
+				if (_r.ProcessItem())
+					//if (_r.ProcessItemData((LPBYTE) hG, _r.GetItemUnpackedSize64()))
+				{
+					IStream* pImageStream = SHCreateMemStream((const BYTE*)origbuf, (UINT)itemSize);
+					HRESULT hr = WICCreate32BitsPerPixelHBITMAP(pImageStream, phBmpThumbnail);
+					pImageStream->Release();
+					//*phBmpThumbnail = ThumbnailFromIStream(pIs, &m_thumbSize, m_showIcon);
+				}
+			}
+			::GlobalUnlock(hG);
+		}
+		GlobalFree(hG);
+		pIs->Release();
+		return ((*phBmpThumbnail) ? S_OK : E_FAIL);
+	}
 
 public:
 	////////////////////////////////////////
 	// IPersistFile::Load
 	HRESULT OnLoad(LPCOLESTR wszFile)
 	{
+		//logit(_T("OnLoad"));
+
 		//ATLTRACE("IPersistFile::Load\n");
 #ifndef UNICODE
 		USES_CONVERSION;
@@ -434,6 +613,8 @@ public:
 	// IExtractImage::GetLocation(LPWSTR pszPathBuffer,	DWORD cchMax, DWORD *pdwPriority, const SIZE *prgSize, DWORD dwRecClrDepth, DWORD *pdwFlags)
 	HRESULT OnGetLocation(const SIZE *prgSize, DWORD *pdwFlags)
 	{
+		//logit(_T("OnGetLocation (%d,%d)"), prgSize->cx, prgSize->cy);
+
 		//ATLTRACE("IExtractImage2::GetLocation\n");
 		m_thumbSize.cx=prgSize->cx;
 		m_thumbSize.cy=prgSize->cy;
@@ -449,6 +630,7 @@ public:
 	// IExtractImage2::GetDateStamp(FILETIME *pDateStamp)
 	HRESULT OnGetDateStamp(FILETIME *pDateStamp)
 	{
+		logit(_T("OnGetDateStamp"));
 		//ATLTRACE("IExtractImage2::GetDateStamp\n");
 		FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
 		CAtlFile _f;
@@ -459,548 +641,75 @@ public:
 	return NOERROR;
 	}
 
-	std::string urlDecode(std::string& SRC)
-	{
-		std::string ret;
-		for (int i = 0; i < SRC.length(); i++)
-		{
-			if (int(SRC[i]) == 37) // 37 is '%'
-			{
-				int ii;
-				sscanf(SRC.substr(i + 1, 2).c_str(), "%x", &ii);
-				char ch = static_cast<char>(ii);
-				ret += ch;
-				i = i + 2;
-			}
-			else
-			{
-				ret += SRC[i];
-			}
-		}
-		return (ret);
-	}
-
-	// EPUP3 standard: open the container.xml file to fetch the path of the rootfile
-	// Requires a successfully opened and not empty zipfile
-	std::string GetEpubRootFile(CUnzip *_z)
-	{
-		std::string rootfile;
-
-		// KBR 20210717 FindZipItem faster than iterating using the zip wrapper
-		int dex;
-		ZIPENTRY ze;
-		FindZipItem(_z->getHZIP(), _T("META-INF/container.xml"), false, &dex, &ze);
-		if (dex < 0)
-			return rootfile;
-		
-		long itemSize = ze.unc_size;
-
-	    HGLOBAL hGContainer = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, itemSize);
-		if (!hGContainer)
-			return rootfile;
-
-		LPVOID pBuf = ::GlobalLock(hGContainer);
-		
-		bool b = false;
-		if (pBuf)
-			b = _z->UnzipItemToMembuffer(dex, pBuf, itemSize);
-
-		if (::GlobalUnlock(hGContainer) != 0 || GetLastError() != NO_ERROR || !b)
-			goto exitGRF;
-
-		{
-			std::string xmlContent = (char*)pBuf;
-
-			size_t posStart = xmlContent.find("rootfile ");
-
-			if (posStart == std::string::npos)
-				goto exitGRF;
-
-			posStart = xmlContent.find("full-path=\"", posStart);
-
-			if (posStart == std::string::npos)
-				goto exitGRF;
-
-			posStart += 11;
-			size_t posEnd = xmlContent.find("\"", posStart);
-
-			rootfile = xmlContent.substr(posStart, posEnd - posStart);
-		}
-		
-	exitGRF:
-		GlobalFree(hGContainer);
-		return rootfile;
-	}
-
-	std::string metaCover(char *pBuf)
-	{
-		std::string xmlContent = pBuf;
-
-		// Find meta tag for cover
-		// I.e. searching for '<meta name="cover" content="cover"/>'
-
-		std::string coverTag, coverId, itemTag;
-
-		size_t posStart = xmlContent.find("name=\"cover\"");
-
-		if (posStart == std::string::npos) {
-			return coverId;
-		}
-
-		posStart = xmlContent.find_last_of("<", posStart);
-		size_t posEnd = xmlContent.find(">", posStart);
-
-		coverTag = xmlContent.substr(posStart, posEnd - posStart + 1);
-
-		// Find cover item id
-
-		posStart = coverTag.find("content=\"");
-
-		if (posStart == std::string::npos) {
-			return coverId;
-		}
-
-		posStart += 9;
-		posEnd = coverTag.find("\"", posStart);
-
-		coverId = coverTag.substr(posStart, posEnd - posStart);
-		return coverId;
-	}
-
-	std::string coverImageItem(char* pBuf, std::string rootpath) {
-
-		// find a <manifest> entry with id of "cover-image"
-		// the href is the path, relative to rootpath
-
-		std::string xmlContent = (char*)pBuf;
-		size_t posManifest = xmlContent.find("<manifest>");
-		if (posManifest == std::string::npos) return std::string();
-
-		size_t posStart = xmlContent.find("id=\"cover-image\"", posManifest);
-		if (posStart == std::string::npos) return std::string();
-
-		// found it, move backward to find owning "<item"
-		size_t posItem = xmlContent.rfind("<item ", posStart);
-		if (posItem == std::string::npos) return std::string();
-
-		// find the href
-		size_t posHref = xmlContent.find("href=\"", posItem);  // TODO this might not match in *this* item
-		posHref += 6;
-		size_t posEnd  = xmlContent.find("\"", posHref);
-
-		return rootpath + xmlContent.substr(posHref, posEnd - posHref);
-	}
-
-	std::string coverHTML(char* pBuf, std::string rootpath) {
-
-
-
-		// 1. find a <manifest> entry with id either "cover" or "icover"
-		// 2. get the href= file
-		// 3. look in the file for an <img> tag
-		// 4. the cover file is the rootpath + the path from the <img src=""> 
-
-		return std::string();
-	}
-
-	HRESULT ExtractEpub(HBITMAP* phBmpThumbnail)
-	{
-		HGLOBAL hGContainer = NULL;
-
-		std::string xmlContent, rootpath, coverfile;
-
-		CUnzip _z;
-		if (!_z.Open(m_cbxFile)) return E_FAIL;
-		int j = _z.GetItemCount();
-		if (j == 0) return E_FAIL;
-
-		std::string rootfile = GetEpubRootFile(&_z);
-
-		size_t posStart, posEnd;
-
-		USES_CONVERSION;
-
-		if (rootfile.length() <= 0)
-			goto test_coverfile;
-
-		posStart = rootfile.rfind('/');
-		if (posStart != std::string::npos) {
-			rootpath = rootfile.substr(0, posStart + 1);
-		}
-
-		int dex = -1;
-		ZIPENTRY ze;
-		memset(&ze, 0, sizeof(ZIPENTRY));
-		FindZipItem(_z.getHZIP(), A2T(rootfile.c_str()), false, &dex, &ze);
-		if (dex < 0)
-			goto test_coverfile;
-
-		_z.GetItem(dex);
-		int i = dex;
-
-		hGContainer = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)_z.GetItemUnpackedSize());
-		if (hGContainer)
-		{
-			bool b = false;
-			LPVOID pBuf = ::GlobalLock(hGContainer);
-			if (pBuf)
-				b = _z.UnzipItemToMembuffer(i, pBuf, _z.GetItemUnpackedSize());
-
-			if (::GlobalUnlock(hGContainer) == 0 && GetLastError() == NO_ERROR && b)
-			{
-				// Find meta tag for cover
-				// I.e. searching for '<meta name="cover" content="cover"/>'
-				std::string coverId = metaCover((char*)pBuf);
-
-				if (coverId.empty()) {
-
-					// Some books [esp. calibre books] don't have a "cover" meta tag.
-					// First test for a <manifest> cover item with id="cover-image"
-					coverfile = coverImageItem((char*)pBuf, rootpath);
-					if (!coverfile.empty()) {
-						goto test_coverfile;
-					}
-
-					// Search for a <manifest> cover item and an image path via HTML file
-					coverfile = coverHTML((char*)pBuf, rootpath);
-					goto test_coverfile;
-				}
-
-				// Find item tag in original opf file contents
-				// I.e. searching for '<item href="cover.jpeg" id="cover" media-type="image/jpeg"/>'. The id
-				// value matching the "content" value from before.
-
-				xmlContent = (char*)pBuf;
-				posStart = xmlContent.find("id=\"" + coverId + "\"");
-				if (posStart != std::string::npos)
-				{
-					posStart = xmlContent.find_last_of("<", posStart);
-					posEnd = xmlContent.find(">", posStart);
-
-					std::string itemTag = xmlContent.substr(posStart, posEnd - posStart + 1);
-
-					// Find cover path in item tag
-
-					posStart = itemTag.find("href=\"");
-
-					if (posStart != std::string::npos)
-					{
-						posStart += 6;
-						posEnd = itemTag.find("\"", posStart);
-
-						if (posEnd != std::string::npos)
-						{
-							std::string coverfile0 = rootpath + itemTag.substr(posStart, posEnd - posStart);
-							coverfile = urlDecode(coverfile0);
-						}
-					}
-				}
-
-				// if there is no matching item id, check to see if 
-				// coverId may specify the actual image as found in some books
-				// I.e. '<meta name="cover" content="Images/cover.jpg" />'
-				// This is a "fall-through" from above because some books use an image path as the id,
-				// e.g. '<meta content="cover.jpg" name="cover"/>'
-				if (coverfile.empty() && IsImage(A2T(coverId.c_str())))
-				{
-					std::string coverfile0 = rootpath + coverId;
-					coverfile = urlDecode(coverfile0);
-				}
-
-			}
-		}
-			
-test_coverfile:
-		if (hGContainer) GlobalFree(hGContainer);
-
-		if (coverfile.empty()) {
-
-			// No cover file specified, do a brute-force search for the first file with "cover" in the name.
-			for (int i = 0; i < j; i++) {
-				if (!_z.GetItem(i)) break;
-				if (_z.ItemIsDirectory() || (_z.GetItemUnpackedSize() > CBXMEM_MAXBUFFER_SIZE)) continue;
-				if ((_z.GetItemPackedSize() == 0) || (_z.GetItemUnpackedSize() == 0)) continue;
-
-				LPCTSTR nm = _z.GetItemName();
-				if (IsImage(nm))
-				{
-					if (_tcsstr(nm, _T("cover")) != NULL ||
-						_tcsstr(nm, _T("COVER")) != NULL ||
-						_tcsstr(nm, _T("Cover")) != NULL)
-					{
-						coverfile = T2A(nm);
-						break;
-					}
-				}
-			}
-		}
-
-		if (!coverfile.empty()) {
-
-			int thumbindex;
-			ZIPENTRY ze;
-			ZRESULT res = FindZipItem(_z.getHZIP(), A2T(coverfile.c_str()), true, &thumbindex, &ze);
-
-			if (thumbindex < 0) return E_FAIL;
-			//go to thumb index
-			if (!_z.GetItem(thumbindex)) return E_FAIL;
-
-			//create thumb			//GHND
-			HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)_z.GetItemUnpackedSize());
-			if (hG)
-			{
-				bool b = false;
-				LPVOID pBuf = ::GlobalLock(hG);
-				if (pBuf)
-					b = _z.UnzipItemToMembuffer(thumbindex, pBuf, _z.GetItemUnpackedSize());
-
-				if (::GlobalUnlock(hG) == 0 && GetLastError() == NO_ERROR)
-				{
-					if (b)
-					{
-						IStream* pIs = NULL;
-						if (S_OK == CreateStreamOnHGlobal(hG, TRUE, (LPSTREAM*)&pIs))//autofree hG
-						{
-							*phBmpThumbnail = ThumbnailFromIStream(pIs, &m_thumbSize, m_showIcon);
-							pIs->Release();
-							pIs = NULL;
-						}
-					}
-				}
-				// GlobalFree(hG); KBR: unnecessary, freed as indicated by 2d param of CreateStreamOnHGlobal above
-			}
-			return ((*phBmpThumbnail) ? S_OK : E_FAIL);
-		}
-		return E_FAIL;
-	}
-
 	////////////////////////////////////
 	//IExtractImage::Extract(HBITMAP* phBmpThumbnail)
 	HRESULT OnExtract(HBITMAP* phBmpThumbnail)
 	{
+		LoadRegistrySettings();
 		*phBmpThumbnail=NULL;
 		//ATLTRACE("IExtractImage::Extract\n");
+		logit(_T("OnExtract '%ls' (%d)"), m_cbxFile, m_showIcon ? 1 : 0);
+
 try {
 		switch (m_cbxType)
 		{
+#ifdef _WIN64
 		case CBXTYPE_MOBI:
-			return ExtractMobiCover(m_cbxFile, phBmpThumbnail);
+			return ExtractMobiCover(m_cbxFile, phBmpThumbnail, m_showIcon);
+#endif
 
 		case CBXTYPE_EPUB:
 		{
-			if (ExtractEpub(phBmpThumbnail) != E_FAIL)
+			if (ExtractEpub(m_cbxFile, phBmpThumbnail, m_thumbSize, m_showIcon) != E_FAIL)
+			{
+				if (m_showIcon)
+					addIcon(phBmpThumbnail);
 				return S_OK;
+			}
 
 			// something wrong with the epub, try falling back on first image in zip
+			logit(_T("__Epub Extract: fallback to ZIP"));
+			// NOTE: fallthrough down to Zip!
 		}
+
 		case CBXTYPE_ZIP:
 		case CBXTYPE_CBZ:
-			{
-				CUnzip _z;
-				if (!_z.Open(m_cbxFile)) return E_FAIL;
-				j=_z.GetItemCount();
-				if (j==0) return E_FAIL;
-
-				CString prevname;//helper vars
-				int thumbindex=-1;
-
-				for (i=0; i<j; i++)
-				{
-					if (!_z.GetItem(i)) break;
-					if (_z.ItemIsDirectory() || (_z.GetItemUnpackedSize() > CBXMEM_MAXBUFFER_SIZE)) continue;
-					if ((_z.GetItemPackedSize()==0) || (_z.GetItemUnpackedSize()==0)) continue;
-
-					if (IsImage(_z.GetItemName()))
-					{
-						if (thumbindex<0) thumbindex=i;// assign thumbindex if already sorted
-
-						if (!m_bSort) break;//if NoSort
-						
-						if (prevname.IsEmpty()) prevname=_z.GetItemName();//can't compare empty string
-						//take only first alphabetical name
-						if (-1==StrCmpLogicalW(_z.GetItemName(), prevname))
-						{
-							thumbindex=i;
-							prevname=_z.GetItemName();
-						}
-					}
-				}//for loop
-
-				if (thumbindex<0) return E_FAIL;
-				//go to thumb index
-				if (!_z.GetItem(thumbindex)) return E_FAIL;
-
-				//create thumb			//GHND
-				HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)_z.GetItemUnpackedSize());
-				if (hG)
-				{
-					bool b=false;
-					LPVOID pBuf=::GlobalLock(hG);
-					if (pBuf)
-					     b=_z.UnzipItemToMembuffer(thumbindex, pBuf, _z.GetItemUnpackedSize());
-
-					if (::GlobalUnlock(hG)==0 && GetLastError()==NO_ERROR)
-					{
-						if (b)
-						{
-							IStream* pIs=NULL;
-							if (S_OK==CreateStreamOnHGlobal(hG, TRUE, (LPSTREAM*)&pIs))//autofree hG
-							{
-								*phBmpThumbnail= ThumbnailFromIStream(pIs, &m_thumbSize, m_showIcon);
-								pIs->Release();
-								pIs=NULL;
-							}
-						}
-					}
-				//GlobalFree(hG);//autofreed
-				}
-
-			return ((*phBmpThumbnail) ? S_OK : E_FAIL);
-			}//dtors!
+			// NOTE: fallthrough from epub!
+			return ExtractZip(phBmpThumbnail, m_bSort);
 		break;
 
 		case CBXTYPE_RAR:
 		case CBXTYPE_CBR:
+			if (ExtractRar(phBmpThumbnail) != E_FAIL)
 			{
-				CUnRar _r;
-				__int64 thumbindex=-1;
+				// Issue #87: show icon for RAR/CBR
+				if (m_showIcon)
+					addIcon(phBmpThumbnail);
+				return S_OK;
+			}
+			break;
 
-				if (m_bSort)
-				{
-					thumbindex=FindThumbnailSortRAR(m_cbxFile);
-					if (thumbindex<0) return E_FAIL;
-				}
+		case CBXTYPE_FB:
+			return ExtractFBCover(m_cbxFile, phBmpThumbnail);
+			break;
 
-				if (!_r.Open(m_cbxFile, FALSE)) return E_FAIL;
-
-				if (m_bSort)
-	  		    {
-			       	//archive flags already checked, go to thumbindex
-					if (!_r.SkipItems(thumbindex)) return E_FAIL;
-					if (!_r.ReadItemInfo()) return E_FAIL;
-				}
-				else 
-				{
-					//skip solid (long processing time), volumes or encrypted file headers
-					if (_r.IsArchiveSolid() || _r.IsArchiveVolume() || _r.IsArchiveEncryptedHeaders()) return E_FAIL;
-
-					while (_r.ReadItemInfo())
-					{
-						//skip directory/empty/ file bigger than 32mb
-						if (!(_r.IsItemDirectory() || (_r.GetItemPackedSize64()==0) || 
-							(_r.GetItemUnpackedSize64()==0) || (_r.GetItemUnpackedSize64() > CBXMEM_MAXBUFFER_SIZE)))
-						{
-							if (IsImage(_r.GetItemName())) {thumbindex=TRUE; break;}
-						}
-
-						_r.SkipItem();//don't forget
-					}
-				}//else
-
-				if (thumbindex<0) return E_FAIL;
-
-				//create thumb
-				IStream* pIs = NULL;
-				HGLOBAL hG = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, (SIZE_T)_r.GetItemUnpackedSize64());
-				if (hG)
-				{
-					if (S_OK==CreateStreamOnHGlobal(hG, TRUE, (LPSTREAM*)&pIs))
-					{
-						_r.SetIStream(pIs);
-						if (_r.ProcessItem()) *phBmpThumbnail= ThumbnailFromIStream(pIs, &m_thumbSize, m_showIcon);
-					}
-				}
-				GlobalFree(hG);
-				pIs->Release();
-			return ((*phBmpThumbnail) ? S_OK : E_FAIL );
-			}//dtors!
-		break;
 		default:return E_FAIL;
 		}
 }
-catch (...){ ATLTRACE("exception in IExtractImage::Extract\n"); return S_FALSE;}
+catch (...) {
+	//ATLTRACE("exception in IExtractImage::Extract\n");
+	logit(_T("exception in IExtractImage::Extract"));
+	return E_FAIL;
+}
 	return S_OK;
-	}
-
-	CString GetEpubTitle(LPCTSTR ePubFile)
-	{
-		CString title;
-		CUnzip _z;
-		if (!_z.Open(m_cbxFile)) return title;
-		int j = _z.GetItemCount();
-		if (j == 0) return title;
-
-		HZIP zipHandle = _z.getHZIP();
-
-		std::string rootfile = GetEpubRootFile(&_z);
-		if (rootfile.empty()) return title;
-
-		USES_CONVERSION;
-
-		HGLOBAL hGContainer = NULL;
-
-		int dex = -1;
-		ZIPENTRY ze;
-		memset(&ze, 0, sizeof(ZIPENTRY));
-		ZRESULT zr = FindZipItem(zipHandle, A2T(rootfile.c_str()), false, &dex, &ze);
-		if (zr == ZR_OK && dex >= 0)
-		{
-			_z.GetItem(dex);
-			int i = dex;
-			size_t itemSize = _z.GetItemUnpackedSize();
-			hGContainer = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, itemSize);
-			if (hGContainer)
-			{
-				bool b = false;
-				LPVOID pBuf = ::GlobalLock(hGContainer);
-				if (pBuf)
-					b = _z.UnzipItemToMembuffer(i, pBuf, (unsigned int)itemSize);
-
-				if (::GlobalUnlock(hGContainer) == 0 && GetLastError() == NO_ERROR)
-				{
-					if (b)
-					{
-						// UTF-8 input to wchar
-
-						CAtlString cstr;
-						LPWSTR ptr = cstr.GetBuffer((int)(itemSize + 1));
-
-						int newLen = MultiByteToWideChar(
-							CP_UTF8, 0,
-							(LPCCH)pBuf, (int)itemSize, ptr, ((int)itemSize + 1)
-						);
-						if (!newLen)
-						{
-							cstr.ReleaseBuffer(0);
-							goto on_exit;
-						}
-						cstr.ReleaseBuffer();
-
-						// Find <dc:title> tag
-
-						int tstart = cstr.Find(_T("<dc:title"));
-						if (tstart == -1) // nope
-							goto on_exit;
-
-						int tstart2 = cstr.Find(_T('>'), tstart); // KBR may be of the form '<dc:title id="title">'
-						int tend = cstr.Find(_T("</dc:title>"), tstart2);
-
-						title = cstr.Mid(tstart2+1, tend-tstart2-1);
-					}
-				}
-			}
-		}
-
-	on_exit:
-		if (hGContainer)
-			GlobalFree(hGContainer);
-		return title;
 	}
 
 	//////////////////////////////
 	//IQueryInfo::GetInfoTip(DWORD dwFlags, LPWSTR *ppwszTip)
 	HRESULT OnGetInfoTip(LPWSTR *ppwszTip)
 	{
+		logit(_T("OnGetInfoTip '%ls'"), m_cbxFile);
+
 		//ATLTRACE("IQueryInfo::GetInfoTip\n");
 try
 {
@@ -1010,6 +719,7 @@ try
 		if (!GetFileSizeCrt(m_cbxFile, _fs)) return E_FAIL;
 
 		TCHAR _tf[16];// SecureZeroMemory?
+		int i, j;
 
 		switch (m_cbxType)
 		{
@@ -1075,20 +785,26 @@ try
 
 	return S_OK;
 }
-catch (...){ ATLTRACE("exception in IQueryInfo::GetInfoTip\n"); return S_FALSE;}
+catch (...)
+{ 
+	//ATLTRACE("exception in IQueryInfo::GetInfoTip\n"); 
+	logit(_T("OnGetInfoTip Exception"));
+	return E_FAIL; // S_FALSE;
+}
 
 	return S_FALSE;
 	}
 
 
 private:
-	CString m_cbxFile;//overcome MAX_PATH limit?
+	CStringW m_cbxFile;//overcome MAX_PATH limit?
 	SIZE m_thumbSize;
-	int i,j;//helpers
 	CBXTYPE m_cbxType;
 	IStream* m_pIs;
 	BOOL m_bSort;
 	BOOL m_showIcon;
+	BOOL m_bSkip;  // V1.7 : skip common scanslation files
+	BOOL m_bCover; // V1.7 : prefer a file with "cover" in the name
 
 
 private:
@@ -1101,25 +817,6 @@ private:
 	return TRUE;
 	}
 
-	inline BOOL StrEqual(LPCTSTR psz1,LPCTSTR psz2) {return (::StrCmpI(psz1, psz2)==0);}
-
-	BOOL IsImage(LPCTSTR szFile)
-	{
-		LPWSTR _e=PathFindExtension(szFile);
-		if (StrEqual(_e, _T(".bmp")))  return TRUE;
-		if (StrEqual(_e, _T(".ico")))  return TRUE;
-		if (StrEqual(_e, _T(".gif")))  return TRUE;
-		if (StrEqual(_e, _T(".jpg")))  return TRUE;
-		if (StrEqual(_e, _T(".jpe")))  return TRUE;
-		if (StrEqual(_e, _T(".jfif"))) return TRUE;
-		if (StrEqual(_e, _T(".jpeg"))) return TRUE;
-		if (StrEqual(_e, _T(".png")))  return TRUE;
-		if (StrEqual(_e, _T(".tif")))  return TRUE;
-		if (StrEqual(_e, _T(".tiff"))) return TRUE;
-		if (StrEqual(_e, _T(".webp"))) return TRUE;  // NOTE: works if a webp codec is installed
-	return FALSE;
-	}
-
 	inline CBXTYPE GetCBXType(LPCTSTR szExt)
 	{
 		if (StrEqual(szExt, _T(".cbz"))) return CBXTYPE_CBZ;
@@ -1128,8 +825,14 @@ private:
 		if (StrEqual(szExt, _T(".rar"))) return CBXTYPE_RAR;
 		if (StrEqual(szExt, _T(".epub"))) return CBXTYPE_EPUB;
 		if (StrEqual(szExt, _T(".phz"))) return CBXTYPE_CBZ;
+#ifdef _WIN64
 		if (StrEqual(szExt, _T(".mobi"))) return CBXTYPE_MOBI;
-	return CBXTYPE_NONE;
+		if (StrEqual(szExt, _T(".azw"))) return CBXTYPE_MOBI;
+		if (StrEqual(szExt, _T(".azw3"))) return CBXTYPE_MOBI;
+#endif
+		if (StrEqual(szExt, _T(".fb2"))) return CBXTYPE_FB;
+
+		return CBXTYPE_NONE;
 	}
 
 	BOOL GetImageCountZIP(LPCTSTR cbzFile, int &imagecount, int &filecount)
@@ -1178,47 +881,6 @@ private:
 	return TRUE;
 	}
 
-	__int64 FindThumbnailSortRAR(LPCTSTR pszFile)
-	{
-		CUnRar _r;
-		if (!_r.Open(pszFile)) return -1;
-		//skip solid (long processing time), volumes or encrypted file headers
-		if (_r.IsArchiveSolid() || _r.IsArchiveVolume() || _r.IsArchiveEncryptedHeaders()) return -1;
-
-		UINT64 _ps,_us;//my speed optimization?
-		CString prevname;
-		__int64 thumbindex=-1;
-		__int64 i=-1;//start at none (-1)
-
-		while (_r.ReadItemInfo())
-		{
-			i+=1;
-			_ps=_r.GetItemPackedSize64();
-			_us=_r.GetItemUnpackedSize64();
-
-			//skip directory/emtpy file/bigger than 32mb
-			if (_r.IsItemDirectory() || (_us>CBXMEM_MAXBUFFER_SIZE) || (_ps==0) || (_us==0))
-			 {_r.SkipItem();continue;}
-
-			//take only index of first alphabetical name
-			if (IsImage(_r.GetItemName()))
-			{	
-				//can't compare empty string
-				if (prevname.IsEmpty()) prevname=_r.GetItemName();
-				if (thumbindex<0) thumbindex=i;// assign thumbindex if already sorted
-				//sort by name
-				if (-1==StrCmpLogicalW(_r.GetItemName(), prevname))
-				{
-					thumbindex=i;
-					prevname=_r.GetItemName();
-				}
-			}
-		_r.SkipItem();//don't forget
-		}
-
-	return thumbindex;
-	}
-
 public:
 	void LoadRegistrySettings()
 	{
@@ -1227,10 +889,15 @@ public:
 		if (ERROR_SUCCESS==_rk.Open(HKEY_CURRENT_USER, CBX_APP_KEY, KEY_READ))
 		{
 			if (ERROR_SUCCESS==_rk.QueryDWORDValue(_T("NoSort"), _d))
-				m_bSort=(_d==FALSE);
+				m_bSort=(_d == 0); // Sort is backward
 			if (ERROR_SUCCESS == _rk.QueryDWORDValue(_T("ShowIcon"), _d))
-				m_showIcon = (_d == TRUE);
+				m_showIcon = (_d == 1);
+			if (ERROR_SUCCESS == _rk.QueryDWORDValue(_T("SkipScanlation"), _d))
+				m_bSkip = (_d == 1);
+			if (ERROR_SUCCESS == _rk.QueryDWORDValue(_T("PreferCover"), _d))
+				m_bCover = (_d == 1);
 		}
+		logit(_T("LRS: %d"), m_bSort);
 	}
 
 #ifdef _DEBUG
